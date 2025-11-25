@@ -296,7 +296,8 @@ function pfi_optimal_choice(params::RBCParams,
     z_loc::Int,
     process::AROneProcess,
     k_0::Vector{Float64},
-    c_policy::Matrix{Float64})::Tuple{Float64,Float64}
+    policy_c::Matrix{Float64},
+    policy_h::Matrix{Float64} )::Tuple{Float64,Float64}
 
     β = params.β
     h_bar = params.h_bar
@@ -309,23 +310,25 @@ function pfi_optimal_choice(params::RBCParams,
     p_vec = process.p[z_loc, :]
     z = states[z_loc]
 
-    function c_next_intern(k_next::Float64)::Float64
+    function policy_intern(policy::Matrix{Float64}, k_next::Float64, z_idx::Integer)::Float64
         k_loc = searchsortedfirst(k_0, k_next)
         bound = [1, length(k_0)]
         if k_loc == bound[1]
-            c_next = c_policy[bound[1], z_loc]
+            policy_next = policy[bound[1], z_idx]
         elseif k_loc >= bound[2]
-            c_next = c_policy[bound[2], z_loc]
+            policy_next = policy[bound[2], z_idx]
         else
-            c_next = (k_next - k_0[k_loc-1]) * (c_policy[k_loc, z_loc] - c_policy[k_loc-1, z_loc]) / (k_0[k_loc] - k_0[k_loc-1]) + c_policy[k_loc-1, z_loc]
+            policy_next = (k_next - k_0[k_loc-1]) * (policy[k_loc, z_idx] - policy[k_loc-1, z_idx]) / (k_0[k_loc] - k_0[k_loc-1]) + policy[k_loc-1, z_idx]
         end
-        return c_next
+        return policy_next
     end
 
+    ## FIXME:modify euler equation
     function eq_1(c::Float64, h::Float64)::Float64
         production_term = k^α * (h - h_bar)^(1 - α)
         k_next = production_term * states .+ (1 - δ) * k .- c
-        c_next = [c_next_intern(k_next[j]) for j in 1:n_states]
+        c_next = [policy_intern(policy_c, k_next[j], j) for j in 1:n_states]
+        h_next = [policy_intern(policy_h, k_next[j], j) for j in 1:n_states]
         eq1 = 1.0 / c - β * sum((1.0 ./ c_next) .* p_vec)
         return eq1
     end
