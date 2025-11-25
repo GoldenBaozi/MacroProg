@@ -1,4 +1,5 @@
 using LinearAlgebra, Optim, Interpolations, Roots, NLsolve, Random
+using SparseArrays, Logging
 
 # construct a type for solving status: 0-converged, 1-not converged, 2-error
 struct SolvingStatus
@@ -291,12 +292,7 @@ function vfi_optimal_choice(params::RBCParams, k::Float64, z::Float64, process::
 
 end
 
-function pfi_optimal_choice(params::RBCParams,
-    k::Float64,
-    z_loc::Int,
-    process::AROneProcess,
-    k_0::Vector{Float64},
-    c_policy::Matrix{Float64})::Tuple{Float64,Float64}
+function pfi_optimal_choice(params::RBCParams, k::Float64, z_loc::Int, process::AROneProcess, k_0::Vector{Float64}, policy_c::Matrix{Float64}, policy_h::Matrix{Float64})::Tuple{Float64,Float64}
 
     β = params.β
     h_bar = params.h_bar
@@ -309,24 +305,25 @@ function pfi_optimal_choice(params::RBCParams,
     p_vec = process.p[z_loc, :]
     z = states[z_loc]
 
-    function c_next_intern(k_next::Float64)::Float64
+    function policy_intern(k_next::Float64, z_idx::Integer, policy_grid::Matrix{Float64})::Float64
         k_loc = searchsortedfirst(k_0, k_next)
         bound = [1, length(k_0)]
         if k_loc == bound[1]
-            c_next = c_policy[bound[1], z_loc]
+            policy_next = policy_grid[bound[1], z_idx]
         elseif k_loc >= bound[2]
-            c_next = c_policy[bound[2], z_loc]
+            policy_next = policy_grid[bound[2], z_idx]
         else
-            c_next = (k_next - k_0[k_loc-1]) * (c_policy[k_loc, z_loc] - c_policy[k_loc-1, z_loc]) / (k_0[k_loc] - k_0[k_loc-1]) + c_policy[k_loc-1, z_loc]
+            policy_next = (k_next - k_0[k_loc-1]) * (policy_grid[k_loc, z_idx] - policy_grid[k_loc-1, z_idx]) / (k_0[k_loc] - k_0[k_loc-1]) + policy_grid[k_loc-1, z_idx]
         end
-        return c_next
+        return policy_next
     end
 
     function eq_1(c::Float64, h::Float64)::Float64
-        production_term = k^α * (h - h_bar)^(1 - α)
+        production_term = k^α * (h - h_bar)^(1 - α) * z
         k_next = production_term * states .+ (1 - δ) * k .- c
-        c_next = [c_next_intern(k_next[j]) for j in 1:n_states]
-        eq1 = 1.0 / c - β * sum((1.0 ./ c_next) .* p_vec)
+        c_next = [policy_intern(k_next[j], j, policy_c) for j in 1:n_states]
+        h_next = [policy_intern(k_next[j], j, policy_h) for j in 1:n_states]
+        eq1 = 1.0 / c - β * sum(((α .* states .* k_next .^ (α - 1) .* (h_next .- h_bar) .^ (1 - α) .+ (1 - δ)) ./ c_next) .* p_vec)
         return eq1
     end
 
@@ -341,14 +338,14 @@ function pfi_optimal_choice(params::RBCParams,
         if c <= 1e-6 || h <= h_bar || h >= 1
             return Inf
         end
-        res = (eq_1(c, h)^2 + eq_2(c, h)^2)/2
+        res = (eq_1(c, h)^2 + eq_2(c, h)^2) / 2
         return res
     end
 
     # Initial guess
     h0 = 0.5 * (h_bar + 1.0)
     c0 = minimum(k^α * (h0 - h_bar)^(1 - α) .* states .+ (1 - δ) * k) * 0.8
-    c_max = minimum(k^α * (1-h_bar)^(1 - α) .* states .+ (1 - δ) * k) - 1e-6
+    c_max = minimum(k^α * (1 - h_bar)^(1 - α) .* states .+ (1 - δ) * k) - 1e-6
     x0 = [c0, h0]
     lower = [1e-6, h_bar]
     upper = [c_max, 1.0]
@@ -359,6 +356,160 @@ function pfi_optimal_choice(params::RBCParams,
     best_h = res[2]
     return best_c, best_h
 end
+
+
+"""
+    compute_value_linear_solve_from_policies(k_grid, policy_c, policy_h, process, params; tol_check=1e-12)
+
+Given converged policy_c and policy_h (size nk x nz), build the sparse operator P consistent
+with your `pfi_optimal_choice` conventions and solve (I - β P) V = u for V.
+
+Returns:
+    V :: Array{Float64}(nk, nz)
+    kprime :: Array{Float64}(nk, nz)   # implied next-capital at each (ik, iz) for bookkeeping
+"""
+function compute_value_linear_solve_from_policies(
+    k_grid::Vector{Float64},
+    policy_c::Array{Float64,2},
+    policy_h::Array{Float64,2},
+    process,
+    params;
+    tol_check::Float64=1e-12
+)
+    nk = length(k_grid)
+    nz = length(process.states)
+    N = nk * nz
+
+    # flatten index: z-major ordering like your code (for iz=1:nz, ik=1:nk)
+    flat_idx(ik, iz) = (iz - 1) * nk + ik
+
+    # shortcuts to params used in pfi_optimal_choice
+    β = params.β
+    h_bar = params.h_bar
+    δ = params.δ
+    α = params.α
+    B = params.B
+
+    # 1) build immediate utility vector uvec of length N
+    uvec = similar(zeros(Float64, N))
+    for iz in 1:nz
+        for ik in 1:nk
+            idx = flat_idx(ik, iz)
+            c = policy_c[ik, iz]
+            h = policy_h[ik, iz]
+
+            # feasibility guard
+            if !(c > 1e-12) || !(h > h_bar) || !(h < 1.0)
+                uvec[idx] = -1e12
+            else
+                # utility: log(c) + B * log(1 - h)
+                uvec[idx] = log(c) + B * log(1.0 - h)
+            end
+        end
+    end
+
+    # 2) compute implied k' at each (ik, iz) following your pfi code:
+    #    production_term = k^α * (h - h_bar)^(1 - α) * z_current
+    #    then k'_j = production_term * process.states[j] + (1-δ)*k - c
+    kprime = zeros(Float64, nk, nz)
+    for iz in 1:nz
+        zcurr = process.states[iz]
+        for ik in 1:nk
+            k = k_grid[ik]
+            c = policy_c[ik, iz]
+            h = policy_h[ik, iz]
+
+            production_term = (k^α) * (h - h_bar)^(1.0 - α) * zcurr
+            # produce k' for each possible next-state -> we only store the one for current iz here,
+            # but later when assembling P we will compute weights over next-state indices.
+            # store the *expected* or representative k' for reference (we still need per-izp values when
+            # assembling P so we recompute there).
+            kprime[ik, iz] = (1.0 - δ) * k + production_term * process.states[1] - c  # placeholder; overwritten below if needed
+            # (We will compute per-izp kp when assembling P below.)
+        end
+    end
+
+    # 3) assemble sparse operator P with same interpolation/boundary logic as your policy_intern
+    rows = Int[]
+    cols = Int[]
+    vals = Float64[]
+
+    for iz in 1:nz
+        zcurr = process.states[iz]
+        for ik in 1:nk
+            row = flat_idx(ik, iz)
+            k = k_grid[ik]
+            c = policy_c[ik, iz]
+            h = policy_h[ik, iz]
+            production_term = (k^α) * (h - h_bar)^(1.0 - α) * zcurr
+
+            # for each possible next-state izp compute kp and interpolation weights
+            for izp in 1:nz
+                kp = production_term * process.states[izp] + (1.0 - δ) * k - c
+                # guard against extremely small/negative kp
+                if kp < 1e-12
+                    kp = 1e-12
+                end
+
+                # locate kp on k_grid using same style as your policy_intern
+                j = searchsortedfirst(k_grid, kp)  # first index >= kp
+                if j == 1
+                    jL, jR = 1, min(2, nk)
+                elseif j > nk
+                    jL, jR = max(1, nk-1), nk
+                else
+                    jR = j
+                    jL = j - 1
+                end
+
+                kL, kR = k_grid[jL], k_grid[jR]
+                if kR == kL
+                    wL, wR = 1.0, 0.0
+                else
+                    wR = (kp - kL) / (kR - kL)
+                    wL = 1.0 - wR
+                end
+
+                pzz = process.p[iz, izp]   # transition prob from iz -> izp
+                colL = flat_idx(jL, izp)
+                colR = flat_idx(jR, izp)
+
+                push!(rows, row); push!(cols, colL); push!(vals, pzz * wL)
+                push!(rows, row); push!(cols, colR); push!(vals, pzz * wR)
+            end
+        end
+    end
+
+    P = sparse(rows, cols, vals, N, N)
+
+    # 4) solve (I - β P) V = uvec
+    A = I - β * P     # supports sparse P
+    Vflat = A \ uvec
+
+    # 5) diagnostic residual
+    resid = uvec + β * (P * Vflat) - Vflat
+    maxresid = maximum(abs.(resid))
+    if maxresid > tol_check
+        @warn "High residual in policy evaluation" maxresid=maxresid
+    end
+
+    V = reshape(Vflat, nk, nz)
+
+    # recompute kprime per (ik, iz) for returning (useful for policy_k)
+    for iz in 1:nz
+        zcurr = process.states[iz]
+        for ik in 1:nk
+            k = k_grid[ik]
+            c = policy_c[ik, iz]
+            h = policy_h[ik, iz]
+            production_term = (k^α) * (h - h_bar)^(1.0 - α) * zcurr
+            kprime[ik, iz] = maximum([production_term * process.states[1] + (1.0 - δ) * k - c, 1e-12]) # just a stored representative; user may want per-izp values
+        end
+    end
+
+    return V, kprime
+end
+
 
 function value_function_iteration(model::HansenRBCModel; tol::Float64=1e-6, max_iter::Int=1000)::VFIResult
     n_states = model.n_states
@@ -452,7 +603,8 @@ function time_iteration(model::HansenRBCModel; tol::Float64=1e-6, max_iter::Int=
     # policy_c multiples a vector from 0.25 to 0.75
     policy_c .= policy_c .* reshape(range(0.25, 0.75, length=n_grids), n_grids, 1)
     policy_c .= policy_c .* reshape(range(0.7, 1.4, length=n_states), 1, n_states)
-    policy_h = fill(params.h_bar+0.1, n_grids, n_states)
+    policy_h = ones(n_grids, n_states)
+    policy_h = policy_h .* reshape(range(0.8, params.h_bar+0.1, length=n_grids), n_grids, 1)
     n_iter = 0
     diff = Inf
     endo_vars = RBCEndogenousVar(n_grids, n_states)
@@ -466,7 +618,7 @@ function time_iteration(model::HansenRBCModel; tol::Float64=1e-6, max_iter::Int=
                     k = k_0[i_k]
                     for i_z in 1:n_states
                         # z = process.states[i_z]
-                        best_c, best_h = pfi_optimal_choice(params, k, i_z, process, k_0, policy_c)
+                        best_c, best_h = pfi_optimal_choice(params, k, i_z, process, k_0, policy_c, policy_h)
                         policy_c_new[i_k, i_z] = best_c
                         policy_h_new[i_k, i_z] = best_h
                     end
@@ -485,8 +637,8 @@ function time_iteration(model::HansenRBCModel; tol::Float64=1e-6, max_iter::Int=
             k_mat = repeat(k_0, 1, n_states)
             z_mat = repeat(process.states', n_grids, 1)
             policy_k .= k_mat .^ params.α .* (policy_h .- params.h_bar) .^ (1 - params.α) .+ (1 - params.δ) .* z_mat .- policy_c .+ (1 - params.δ) .* k_mat
-            v_func .= log.(policy_c) .+ params.B .* log.(1 .- policy_h) .+ params.β .* (process.p * v_func')'
-            update!(endo_vars, policy_k, policy_c, policy_h, v_func)
+            V_matrix, kprime = compute_value_linear_solve_from_policies(k_0, policy_c, policy_h, process, params)
+            update!(endo_vars, kprime, policy_c, policy_h, V_matrix)
             return VFIResult(
                 endo_vars;
                 status=SolvingStatus(0, "Converged successfully."),
