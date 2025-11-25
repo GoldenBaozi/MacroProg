@@ -40,69 +40,6 @@ model = HansenRBCModel(params, process, k_0)
 println("   Solving model using time iteration...")
 solve_model!(model; method="TI", tol=1e-6, max_iter=200)
 
-
-# β = params.β
-# h_bar = params.h_bar
-# δ = params.δ
-# α = params.α
-# B = params.B
-
-# states = process.states
-# n_states = process.N
-# n_grids = length(k_0)
-# z_loc = 1
-# p_vec = process.p[z_loc, :]
-# z = states[z_loc]
-
-# v_func = zeros(n_grids, n_states)
-# policy_k = zeros(n_grids, n_states)
-# policy_c = repeat(k_0, 1, n_states)
-# # policy_c multiples a vector from 0.25 to 0.75
-# policy_c .= policy_c .* reshape(range(0.25, 0.75, length=n_grids), n_grids, 1)
-# policy_h = fill(params.h_bar+0.1, n_grids, n_states)
-# n_iter = 0
-# diff = Inf
-# endo_vars = RBCEndogenousVar(n_grids, n_states)
-# max_iter = 100
-# tol = 1e-6
-# for iter in 1:max_iter
-#     n_iter += 1
-#     policy_c_new = zeros(n_grids, n_states)
-#     policy_h_new = zeros(n_grids, n_states)
-#     for i_k in 1:n_grids
-#         k = k_0[i_k]
-#         for i_z in 1:n_states
-#             # z = process.states[i_z]
-#             best_c, best_h = pfi_optimal_choice(params, k, i_z, process, k_0, policy_c)
-#             policy_c_new[i_k, i_z] = best_c
-#             policy_h_new[i_k, i_z] = best_h
-#         end
-#     end
-#     diff = maximum(abs.(policy_c_new .- policy_c)) # add policy_h difference 
-#     diff = max(diff, maximum(abs.(policy_h_new .- policy_h)))
-#     policy_c .= policy_c_new
-#     policy_h .= policy_h_new
-
-#     if diff < tol
-#         break
-#     end
-# end
-
-
-# # Initial guess
-# k = k_0[10]
-# h0 = 0.5 * (h_bar + 1.0)
-# c0 = minimum(k^α * (h0 - h_bar)^(1 - α) .* states .+ (1 - δ) * k) * 0.8
-# c_max = minimum(k^α * (1-h_bar)^(1 - α) .* states .+ (1 - δ) * k) - 1e-6
-# x0 = [c0, h0]
-# lower = [1e-6, h_bar]
-# upper = [c_max, 1.0]
-# result = optimize(f, lower, upper, x0, Fminbox(ConjugateGradient()))
-
-# res = Optim.minimizer(result)
-# best_c = res[1]
-# best_h = res[2]
-
 if model.solving_result.status.status == 0
     println("   ✓ Model solved successfully!")
     println("   ✓ Converged in $(model.solving_result.n_loops) iterations")
@@ -121,6 +58,7 @@ p = plot()
 for j in 1:process.N
     plot!(p, k_0, v_func[:, j], label="State $(j)", linewidth=2)
 end
+title!(p, "Value Function")
 display(p)
 
 p_k = plot()
@@ -133,7 +71,50 @@ p_h = plot()
 for j in 1:process.N
     plot!(p_h, k_0, policy_h[:, j], label="State $(j)", linewidth=2)
 end
+title!(p_h, "Labor Policy Function")
 display(p_h)
+
+p_c = plot()
+for j in 1:process.N
+    plot!(p_c, k_0, policy_c[:, j], label="State $(j)", linewidth=2)
+end
+display(p_c)
+
+solve_model!(model; method="VFI", tol=1e-6, max_iter=1000)
+if model.solving_result.status.status == 0
+    println("   ✓ Model solved successfully using VFI!")
+    println("   ✓ Converged in $(model.solving_result.n_loops) iterations")
+    println("   ✓ Time used: $(round(model.solving_result.time_used, digits=3)) seconds")
+else
+    println("   ✗ Model solving failed using VFI: $(model.solving_result.status.message)")
+    # exit()
+end
+v_func_VFI = model.endogenous_vars.v_func
+policy_k_VFI = model.endogenous_vars.policy_k
+policy_h_VFI = model.endogenous_vars.policy_h
+policy_c_VFI = model.endogenous_vars.policy_c
+
+# compare TI and VFI results
+p_diff = plot()
+for j in 1:process.N
+    plot!(p_diff, k_0, abs.(policy_h[:, j] - policy_h_VFI[:, j]), label="State $(j)", linewidth=2)
+end
+title!(p_diff, "Labor Policy Function Difference (TI vs VFI)")
+display(p_diff)
+
+p_k_diff = plot()
+for j in 1:process.N
+    plot!(p_k_diff, k_0, abs.(policy_k[:, j] - policy_k_VFI[:, j]), label="State $(j)", linewidth=2)
+end
+title!(p_k_diff, "Capital Policy Function Difference (TI vs VFI)")
+display(p_k_diff)
+
+p_c_diff = plot()
+for j in 1:process.N
+    plot!(p_c_diff, k_0, abs.(policy_c[:, j] - policy_c_VFI[:, j]), label="State $(j)", linewidth=2)
+end
+title!(p_c_diff, "Consumption Policy Function Difference (TI vs VFI)")
+display(p_c_diff)
 
 # # 5. Compute steady state
 # println("\n5. Computing steady state...")

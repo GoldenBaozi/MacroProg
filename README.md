@@ -4,7 +4,7 @@
 
 - RBC model (indivisible labor)
   - [x] VFI
-  - [ ] PFI (in progress)
+  - [x] PFI (in progress)
   - [ ] perturbation (TODO)
   - [ ] endogenous grid (TODO)
 - Krusell-Smith model (TODO)
